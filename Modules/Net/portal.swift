@@ -100,8 +100,9 @@ public class Portal: PortalWrapper {
             }
             
             if let view = self.publicIPField, view.stringValue != value.raddr.v4 {
-                if let addr = value.raddr.v4 {
-                    view.stringValue = (value.wifiDetails.countryCode != nil) ? "\(addr) (\(value.wifiDetails.countryCode!))" : addr
+                if let addr = value.raddr.v4 {                    
+                    // view.stringValue = (value.wifiDetails.countryCode != nil) ? "\(addr) (\(value.wifiDetails.countryCode!))" : addr
+                    view.stringValue = addr
                 } else {
                     view.stringValue = localizedString("Unknown")
                 }

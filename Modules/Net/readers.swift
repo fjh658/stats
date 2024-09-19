@@ -13,6 +13,7 @@ import Cocoa
 import Kit
 import SystemConfiguration
 import CoreWLAN
+import CoreLocation
 
 struct ipResponse: Decodable {
     var ip: String
@@ -21,7 +22,7 @@ struct ipResponse: Decodable {
 }
 
 // swiftlint:disable control_statement
-extension CWPHYMode: CustomStringConvertible {
+extension CWPHYMode: @retroactive CustomStringConvertible {
     public var description: String {
         switch(self) {
         case .mode11a:  return "802.11a"
@@ -36,7 +37,7 @@ extension CWPHYMode: CustomStringConvertible {
     }
 }
 
-extension CWInterfaceMode: CustomStringConvertible {
+extension CWInterfaceMode: @retroactive CustomStringConvertible {
     public var description: String {
         switch(self) {
         case .hostAP:       return "AP"
@@ -48,7 +49,7 @@ extension CWInterfaceMode: CustomStringConvertible {
     }
 }
 
-extension CWSecurity: CustomStringConvertible {
+extension CWSecurity: @retroactive CustomStringConvertible {
     public var description: String {
         switch(self) {
         case .none:               return "none"
@@ -71,7 +72,7 @@ extension CWSecurity: CustomStringConvertible {
     }
 }
 
-extension CWChannelBand: CustomStringConvertible {
+extension CWChannelBand: @retroactive CustomStringConvertible {
     public var description: String {
         switch(self) {
         case .band2GHz:     return "2 GHz"
@@ -83,7 +84,7 @@ extension CWChannelBand: CustomStringConvertible {
     }
 }
 
-extension CWChannelWidth: CustomStringConvertible {
+extension CWChannelWidth: @retroactive CustomStringConvertible {
     public var description: String {
         switch(self) {
         case .width20MHz:   return "20 MHz"
@@ -103,7 +104,7 @@ extension CWChannel {
     }
 }
 
-internal class UsageReader: Reader<Network_Usage> {
+internal class UsageReader: Reader<Network_Usage>, CLLocationManagerDelegate {
     private var reachability: Reachability = Reachability(start: true)
     private let variablesQueue = DispatchQueue(label: "eu.exelban.NetworkUsageReader")
     private var _usage: Network_Usage = Network_Usage()
@@ -113,11 +114,18 @@ internal class UsageReader: Reader<Network_Usage> {
     }
     
     private var primaryInterface: String {
+        // get {
+        //      if let global = SCDynamicStoreCopyValue(nil, "State:/Network/Global/IPv4" as CFString), let name = global["PrimaryInterface"] as? String {
+        //          return name
+        //      }
+        //      return ""
+        // }
+        
         get {
-            if let global = SCDynamicStoreCopyValue(nil, "State:/Network/Global/IPv4" as CFString), let name = global["PrimaryInterface"] as? String {
-                return name
-            }
-            return ""
+            // Use shell command to get the first non-utun `enX` network interface
+            let primaryInterface = syncShell("/usr/sbin/scutil --nwi | awk '/Network interfaces:/ {for (i=3; i<=NF; i++) if ($i ~ /^en/) {print $i; exit}}'")
+            // Trim the newline character from the result
+            return primaryInterface.trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
     
@@ -141,7 +149,16 @@ internal class UsageReader: Reader<Network_Usage> {
         get { Store.shared.bool(key: "Network_VPNMode", defaultValue: false) }
     }
     
+    private var locationManager: CLLocationManager?
+    
     public override func setup() {
+        // Initialize CLLocationManager
+        self.locationManager = CLLocationManager()
+        self.locationManager?.delegate = self
+
+        // Request location authorization
+        self.locationManager?.requestAlwaysAuthorization()
+        
         self.reachability.reachable = {
             if self.active {
                 self.getPublicIP()
@@ -205,6 +222,22 @@ internal class UsageReader: Reader<Network_Usage> {
         
         self.usage.bandwidth.upload = current.upload
         self.usage.bandwidth.download = current.download
+    }
+    
+    private func determinePHYMode(fromTransmitRate rate: Double) -> String {
+        if rate <= 11 {
+            return "802.11b"
+        } else if rate <= 54 {
+            return "802.11a/g"
+        } else if rate <= 600 {
+            return "802.11n"
+        } else if rate <= 3466.8 {
+            return "802.11ac"
+        } else if rate > 3466.8 {
+            return "802.11ax"
+        } else {
+            return "unknown"
+        }
     }
     
     private func readInterfaceBandwidth() -> Bandwidth {
@@ -301,6 +334,32 @@ internal class UsageReader: Reader<Network_Usage> {
         return Bandwidth(upload: totalUpload, download: totalDownload)
     }
     
+    private func getActiveMacAddress(interfaceName: String) -> String? {
+        let task = Process()
+        task.launchPath = "/sbin/ifconfig"
+        task.arguments = [interfaceName]
+
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.launch()
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+
+        let output = String(data: data, encoding: .utf8)
+        
+        // Regex pattern to extract the MAC address
+        let macRegex = try! NSRegularExpression(pattern: "([a-fA-F0-9]{2}:){5}[a-fA-F0-9]{2}", options: [])
+        let matches = macRegex.matches(in: output ?? "", options: [], range: NSRange(location: 0, length: output?.count ?? 0))
+        
+        if let match = matches.first {
+            let macAddress = (output as NSString?)?.substring(with: match.range)
+            return macAddress
+        }
+        
+        return nil
+    }
+    
     public func getDetails() {
         guard self.interfaceID != "" else { return }
         
@@ -308,7 +367,9 @@ internal class UsageReader: Reader<Network_Usage> {
             if let bsdName = SCNetworkInterfaceGetBSDName(interface as! SCNetworkInterface), bsdName as String == self.interfaceID,
                let type = SCNetworkInterfaceGetInterfaceType(interface as! SCNetworkInterface),
                let displayName = SCNetworkInterfaceGetLocalizedDisplayName(interface as! SCNetworkInterface),
-               let address = SCNetworkInterfaceGetHardwareAddressString(interface as! SCNetworkInterface) {
+               // let address = SCNetworkInterfaceGetHardwareAddressString(interface as! SCNetworkInterface) {
+               // Function to get the active MAC address of a specified network interface using 'ifconfig'
+               let address = getActiveMacAddress(interfaceName: bsdName as String) {
                 self.usage.interface = Network_interface(displayName: displayName as String, BSDName: bsdName as String, address: address as String)
                 
                 switch type {
@@ -336,7 +397,8 @@ internal class UsageReader: Reader<Network_Usage> {
                 self.usage.wifiDetails.noise = interface.noiseMeasurement()
                 self.usage.wifiDetails.transmitRate = interface.transmitRate()
                 
-                self.usage.wifiDetails.standard = interface.activePHYMode().description
+                // self.usage.wifiDetails.standard = interface.activePHYMode().description, return unknown on sequoia
+                self.usage.wifiDetails.standard = determinePHYMode(fromTransmitRate: interface.transmitRate())
                 self.usage.wifiDetails.mode = interface.interfaceMode().description
                 self.usage.wifiDetails.security = interface.security().description
                 
@@ -348,13 +410,52 @@ internal class UsageReader: Reader<Network_Usage> {
                     self.usage.wifiDetails.channelNumber = ch.channelNumber.description
                 }
             }
-            
+                        
             if self.usage.wifiDetails.ssid == nil || self.usage.wifiDetails.ssid == "" {
-                let networksetupResponse = syncShell("networksetup -getairportnetwork \(self.interfaceID)")
-                if networksetupResponse.split(separator: "\n").count == 1 {
-                    let arr = networksetupResponse.split(separator: ":")
-                    if let ssid = arr.last {
-                        self.usage.wifiDetails.ssid = ssid.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                if #available(macOS 15, *) {
+                    // 1. /usr/sbin/system_profiler SPAirPortDataType -json
+                    
+                    // 2. Parse JSON to get WiFi details: SPAirPortDataType -> spairport_airport_interfaces -> (find "_name" : self.interfaceID) -> spairport_current_network_information
+                    
+                    // 3. current_network_information
+                    // "spairport_current_network_information" : {
+                    //    "_name" : "my-ssid",
+                    //    "spairport_network_channel" : "64 (5GHz, 20MHz)",
+                    //    "spairport_network_country_code" : "US",
+                    //    "spairport_network_mcs" : 8,
+                    //    "spairport_network_phymode" : "802.11ac",
+                    //    "spairport_network_rate" : 117,
+                    //    "spairport_network_type" : "spairport_network_type_station",
+                    //    "spairport_security_mode" : "spairport_security_mode_wpa2_personal",
+                    //    "spairport_signal_noise" : "-61 dBm / -93 dBm"
+                    // }
+                    
+                    let airportInfo = syncShell("/usr/sbin/system_profiler SPAirPortDataType -json")
+                        
+                    guard let json = try? JSONSerialization.jsonObject(with: airportInfo.data(using: .utf8) ?? Data()) as? [String: Any],
+                          let interfaces = (json["SPAirPortDataType"] as? [[String: Any]])?.first?["spairport_airport_interfaces"] as? [[String: Any]] else {
+                        error("Error: Failed to parse system_profiler output")
+                        return
+                    }
+                    
+                    if let currentNetworkInfo = interfaces.first(where: { $0["_name"] as? String == self.interfaceID })?["spairport_current_network_information"] as? [String: Any],
+                       let ssid = currentNetworkInfo["_name"] as? String,
+                       let phyMode = currentNetworkInfo["spairport_network_phymode"] as? String,
+                       !ssid.isEmpty, !phyMode.isEmpty {
+                        self.usage.wifiDetails.ssid = ssid
+                        self.usage.wifiDetails.standard = phyMode
+                    } else {
+                        error("Warning: No valid WiFi details found for interface \(self.interfaceID)")
+                    }
+                }
+                else {
+                    // Fallback to the existing mechanism for macOS versions below 15
+                    let networksetupResponse = syncShell("networksetup -getairportnetwork \(self.interfaceID)")
+                    if networksetupResponse.split(separator: "\n").count == 1 {
+                        let arr = networksetupResponse.split(separator: ":")
+                        if let ssid = arr.last {
+                            self.usage.wifiDetails.ssid = ssid.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                        }
                     }
                 }
             }
@@ -380,21 +481,45 @@ internal class UsageReader: Reader<Network_Usage> {
             let ipv6: String?
         }
         
+        struct LocationResponse: Codable {
+            let country: String?
+            let address: String?
+            let code: String?
+            let flag: String?
+        }
+        
         DispatchQueue.global(qos: .userInitiated).async {
-            let response = syncShell("curl -s -4 https://api.serhiy.io/v1/stats/ip")
-            if !response.isEmpty, let data = response.data(using: .utf8),
-               let addr = try? JSONDecoder().decode(Addr_s.self, from: data) {
-                if let ip = addr.ipv4, self.isIPv4(ip) {
-                    self.usage.raddr.v4 = ip
+            // Fetch IPv4 address and country code using iStat Menus API
+            let ipv4Response = syncShell("/usr/bin/curl -s -H \"Host: ip.istatmenus.app\" -H \"Accept: */*\" -H \"User-Agent: iStat%20Menus%20Menubar/2199 CFNetwork/1568.100.1 Darwin/24.0.0\" -H \"Accept-Language: en-US,en;q=0.9\" -H \"bjangoclient: istatmenus\" --compressed \"https://ip.istatmenus.app/geolocation/client.php\"")
+            
+            if !ipv4Response.isEmpty, let data = ipv4Response.data(using: .utf8),
+               let addr = try? JSONDecoder().decode(LocationResponse.self, from: data) {
+                if let ip = addr.address, self.isIPv4(ip) {
+                    let countryCode = addr.code ?? ""
+                    // Update the usage structure with the IPv4 and country code
+                    if countryCode.isEmpty {
+                        self.usage.raddr.v4 = "\(ip)"
+                    } else {
+                        self.usage.raddr.v4 = "\(ip) (\(countryCode))"
+                    }
                 }
             }
         }
+
         DispatchQueue.global(qos: .userInitiated).async {
-            let response = syncShell("curl -s -6 https://api.serhiy.io/v1/stats/ip")
-            if !response.isEmpty, let data = response.data(using: .utf8),
-               let addr = try? JSONDecoder().decode(Addr_s.self, from: data) {
-                if let ip = addr.ipv6, !self.isIPv4(ip) {
-                    self.usage.raddr.v6 = ip
+            // Fetch IPv6 address and country code using iStat Menus API
+            let ipv6Response = syncShell("/usr/bin/curl -s -H \"Host: ip6.istatmenus.app\" -H \"Accept: */*\" -H \"User-Agent: iStat%20Menus%20Menubar/2199 CFNetwork/1568.100.1 Darwin/24.0.0\" -H \"Accept-Language: en-US,en;q=0.9\" -H \"bjangoclient: istatmenus\" --compressed \"https://ip6.istatmenus.app/geolocation/client.php\"")
+            
+            if !ipv6Response.isEmpty, let data = ipv6Response.data(using: .utf8),
+               let addr = try? JSONDecoder().decode(LocationResponse.self, from: data) {
+                if let ip = addr.address, !self.isIPv4(ip) { // Ensure it's an IPv6 address
+                    let countryCode = addr.code ?? ""
+                    // Update the usage structure with the IPv6 and country code
+                    if countryCode.isEmpty {
+                        self.usage.raddr.v6 = "\(ip)"
+                    } else {
+                        self.usage.raddr.v6 = "\(ip) (\(countryCode))"
+                    }
                 }
             }
         }

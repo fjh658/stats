@@ -461,8 +461,9 @@ internal class Popup: PopupWrapper {
                             self.addressView?.addArrangedSubview(view)
                             self.recalculateHeight()
                         }
-                        if self.publicIPv4Field?.stringValue != addr {
-                            self.publicIPv4Field?.stringValue = (value.wifiDetails.countryCode != nil) ? "\(addr) (\(value.wifiDetails.countryCode!))" : addr
+                        if self.publicIPv4Field?.stringValue != addr {                            
+                            // self.publicIPv4Field?.stringValue = (value.wifiDetails.countryCode != nil) ? "\(addr) (\(value.wifiDetails.countryCode!))" : addr
+                            self.publicIPv4Field?.stringValue = addr
                         }
                     } else if view.superview != nil {
                         view.removeFromSuperview()
